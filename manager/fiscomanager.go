@@ -156,15 +156,14 @@ func (this *FiscoManager) MonitorChain() {
 	for {
 		select {
 		case <-fetchBlockTicker.C:
-			log.Info("in !!!!")
+			log.Debugf("FISCO链监控服务 - 开始获取FISCO BCOS区块高度(缓存区块高度：%d)", this.currentHeight)
 			currHeight, err := this.BlockNumber()
-			log.Info("out !!!!")
+			log.Debugf("FISCO链监控服务 - 结束获取FISCO BCOS区块高度(获取区块高度：%d)", currHeight)
 			if err != nil {
-				log.Fatalf("FiscoManager MonitorChain - failed to get current fisco height: %v", err)
+				log.Fatalf("FISCO链监控服务 - 获取FISCO BCOS区块高度时异常: %v", err)
 				continue
 			}
 			height := uint64(currHeight)
-			log.Debugf("FiscoManager MonitorChain - fiscobcos chain current height: %d", height)
 			if height <= this.currentHeight {
 				continue
 			}
@@ -172,7 +171,7 @@ func (this *FiscoManager) MonitorChain() {
 				if this.FetchLockDepositEvents(this.currentHeight + 1) {
 					this.currentHeight++
 					if err := this.db.UpdateFiscoHeight(this.currentHeight); err != nil {
-						log.Errorf("FiscoManager MonitorChain - save new height %d to DB failed: %v", this.currentHeight, err)
+						log.Errorf("FISCO链监控服务 - 将新高度[%d]保存到数据库失败：%v", this.currentHeight, err)
 					}
 				}
 			}
@@ -325,24 +324,20 @@ func (this *FiscoManager) StartTransact(toAccAddr string, amount int64) {
  * SubscribeBlockNumber
  */
 func (this *FiscoManager) SubscribeBlockNumber() {
-	/**
-	 *Set block height notification
-	 */
+	// 设置块高度通知
 	this.client.SubscribeBlockNumberNotify(this.NotifyBlockNumber)
 
-	/**
-	 *Get the current latest block height
-	 */
+	// 获取当前最新块高度
 	currHeight, err := this.BlockNumber()
 	if err != nil {
-		log.Fatalf("FiscoManager MonitorChain - failed to get current fisco height: %v", err)
+		log.Fatalf("FISCO链监控服务 - 获取最新FISCO区块高度失败: %v", err)
 		return
 	}
 	this.NotifyBlockNumber(currHeight)
 }
 
 func (this *FiscoManager) NotifyBlockNumber(blockNumber int64) {
-	log.Infof("MonitorChain - fisco chain current height: %v", blockNumber)
+	log.Debugf("FISCO链监控服务 - FISCO最新区块高度: %v", blockNumber)
 	height := uint64(blockNumber)
 	if height <= this.currentHeight {
 		return
@@ -351,11 +346,10 @@ func (this *FiscoManager) NotifyBlockNumber(blockNumber int64) {
 		if this.FetchLockDepositEvents(this.currentHeight + 1) {
 			this.currentHeight++
 			if err := this.db.UpdateFiscoHeight(this.currentHeight); err != nil {
-				log.Errorf("FiscoManager MonitorChain - save new height %d to DB failed: %v", this.currentHeight, err)
+				log.Errorf("FISCO链监控服务 - 将最新高度[%d]保存到数据库失败：%v", this.currentHeight, err)
 			}
 		}
 	}
-
 }
 
 func (this *FiscoManager) BlockNumber() (int64, error) {
@@ -419,32 +413,40 @@ type BlockRes struct {
 }
 
 func (this *FiscoManager) FetchLockDepositEvents(height uint64) bool {
+	// 通过配置获取跨链管理合约地址
 	eccmAddress := comm.HexToAddress(this.config.FiscoConfig.ECCMContractAddress)
+	// 通过跨链管理合约管理器获取跨链管理合约
 	eccmContract, err := eccm_abi.NewEthCrossChainManager(eccmAddress, this.client)
 	if err != nil {
 		return false
 	}
+	// 根据区块高度获取FISCO区块数据
 	blk, err := this.client.GetBlockByNumber(context.Background(), strconv.FormatUint(height, 10), false)
 	if err != nil {
-		log.Errorf("fetchLockDepositEvents - GetBlockByNumber error :%s", err.Error())
+		log.Errorf("FetchLockDepositEvents - 根据块号获取区块失败：%s", err.Error())
 		return false
 	}
+	// 解析区块
 	res := &BlockRes{}
 	err = json.Unmarshal(blk, res)
 	if err != nil {
-		log.Errorf("fetchLockDepositEvents - Unmarshal error :%s", err.Error())
+		log.Errorf("FetchLockDepositEvents - 解析区块失败：%s", err.Error())
 		return false
 	}
+	// 获取获取交易数据
 	for _, tx := range res.Transactions {
+		// 获取交易回执
 		recp, err := this.client.TransactionReceipt(context.Background(), comm.HexToHash(tx))
 		if err != nil {
-			log.Errorf("fetchLockDepositEvents - TransactionReceipt error: %s", err.Error())
+			log.Errorf("FetchLockDepositEvents - 获取交易回执失败: %s", err.Error())
 			continue
 		}
 		if recp.Status != 0 {
 			continue
 		}
+		// 获取交易回执中的日志
 		for _, v := range recp.Logs {
+			// 检查交易回执中的地址是否与配置中管理合约地址是否相同
 			if v.Address != strings.ToLower(this.config.FiscoConfig.ECCMContractAddress) {
 				continue
 			}
@@ -453,6 +455,7 @@ func (this *FiscoManager) FetchLockDepositEvents(height uint64) bool {
 				topics[i] = comm.HexToHash(t.(string))
 			}
 			rawData, _ := hex.DecodeString(strings.TrimPrefix(v.Data, "0x"))
+			// 获取跨链事件
 			evt, err := eccmContract.ParseCrossChainEvent(types.Log{
 				Address: comm.HexToAddress(v.Address),
 				Topics:  topics,
@@ -461,10 +464,11 @@ func (this *FiscoManager) FetchLockDepositEvents(height uint64) bool {
 			if err != nil || evt == nil {
 				continue
 			}
-
+			// 检查是否配置目标应用合约信息
 			var isTarget bool
 			if len(this.config.TargetContracts) > 0 {
 				toContractStr := evt.ProxyOrAssetContract.String()
+				// 循环遍历目标应用合约列表
 				for k, v := range this.config.TargetContracts {
 					ok := k == toContractStr
 					if ok {
@@ -487,13 +491,13 @@ func (this *FiscoManager) FetchLockDepositEvents(height uint64) bool {
 					continue
 				}
 			}
+			// 发送跨链信息
 			hash, err := this.SendCrossChainInfoWithRaw(evt.Rawdata)
 			if err != nil {
-				log.Errorf("failed to send for fisco tx %s: (error: %v, raw_data: %x)", tx, err, rawData)
+				log.Errorf("发送FISCO交易[交易哈希：%s]失败，失败原因：%v！！", tx, err)
 				continue
 			}
-			log.Infof("fetchLockDepositEvents - successful to send cross chain info: (tx_hash: %s, fisco_hash: %s)",
-				hash.ToHexString(), tx)
+			log.Infof("FetchLockDepositEvents - 发送跨链信息成功: (中继链交易哈希: %s, FISCO交易哈希: %s)", hash.ToHexString(), tx)
 		}
 	}
 
